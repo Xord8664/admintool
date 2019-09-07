@@ -1,0 +1,705 @@
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, GObject
+import subprocess
+import paramiko
+import gettext
+from threading import Thread
+import time
+import re
+import dmidecode
+import json
+import ast
+import psutil
+import wakeonlan
+
+# i18n
+gettext.install("rdwa", "/usr/share/rdwa/locale")
+
+class YesNoDialog(Gtk.Dialog):
+    def __init__(self, parent, msg):
+        Gtk.Dialog.__init__(self, "Confirm", parent, 0,
+            (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+             Gtk.STOCK_OK, Gtk.ResponseType.OK))
+        self.set_default_size(150, 100)
+        label = Gtk.Label(msg)
+        box = self.get_content_area()
+        box.add(label)
+        self.show_all()
+        
+class ErrorDialog(Gtk.Dialog):
+    def __init__(self, parent, msg):
+        Gtk.Dialog.__init__(self, "ERROR!", parent, 0,
+            (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL))
+        self.set_default_size(150, 100)
+        label = Gtk.Label(msg)
+        box = self.get_content_area()
+        box.add(label)
+        self.show_all()
+
+class AdminWindow(Gtk.Window):
+    hosts = {}      # List store data (all data about all hosts)
+    services = {}       #
+    active_host = None
+    
+    cmd = "systemctl list-unit-files --type socket,service | tail -n+2 | head -n-3"
+    
+    # gonna be used for tabs creation
+    host = 'hostname/ip'
+    port = '22'
+    user = 'username'
+    passwd = 'qwerty'
+    key_auth = False
+    key_file = ""
+    key_path = None     # Gtk.Label
+    type_ids = [ "BIOS", "System", "Baseboard", "Chassis", "Processor", "Memory Controller", "Memory Module", "Cache", "Port Connector", "System Slots",\
+                "On Board Devices", "OEM Strings", "System Configuration Options", "BIOS Language", "Group Associatins", "System Event Log",\
+                "Physical Memory Array", "Memory Device", "32-bit Memory Error", "Memory Array Mapped Address", "Memory Device Mapped Address",\
+                "Built-in Pointing Device", "Portable Battery", "System Reset", "Hardware Security", "System Power Controls", "Voltage Probe",\
+                "Cooling Device", "Temperature Probe", "Electrical Current Probe", "Out-of-band Remote Access", "Boot Integrity Service", "System Boot",\
+                "64-bit Memory Error", "Management Device", "Management Device Component", "Management Device Threshold Data", "Memory Channel",\
+                "IPMI Device", "Power Supply", "Additional Information", "Onboard Devices Extended Information", "Management Controller Host Interface" ]
+    mac_str = "aa.bb.cc.dd.ee.ff"
+    
+    def __init__(self):
+        Gtk.Window.__init__(self, title="AdminTool")
+        self.set_default_size(1024, 768)
+
+        startstop_button = Gtk.Button.new_with_label("Start/Stop service")
+        startstop_button.connect("clicked", self.change_state)
+        
+        enabledisable_button = Gtk.Button.new_with_label("Enable/Disable service")
+        enabledisable_button.connect("clicked", self.change_unitfilestate)
+        
+        connect_button = Gtk.Button.new_with_label("Connect")
+        connect_button.connect("clicked", self.connect_func)
+        
+        disconnect_button = Gtk.Button.new_with_label("Disconnect")
+        disconnect_button.connect("clicked", self.disconnect_func)
+        
+        wakeonlan_button = Gtk.Button.new_with_label("Wake-on-lan")
+        wakeonlan_button.connect("clicked", self.wakeonlan_func)
+        
+        self.entry_host = Gtk.Entry()
+        self.entry_port = Gtk.Entry()
+        self.entry_user = Gtk.Entry()
+        self.entry_passwd = Gtk.Entry()
+        self.entry_mac = Gtk.Entry()
+
+        self.entry_host.set_text(self.host)
+        self.entry_port.set_text(self.port)
+        self.entry_user.set_text(self.user)
+        self.entry_passwd.set_text(self.passwd)
+        self.entry_passwd.set_visibility(False)
+        self.entry_mac.set_text(self.mac_str)
+        
+        label_services_control = Gtk.Label("Services:")
+        label_remote = Gtk.Label("Remote PC:")
+        label_wol = Gtk.Label("Wake on LAN")
+        label_machine_control = Gtk.Label("Hardware:")
+        separator = Gtk.Separator(orientation=Gtk.Orientation.VERTICAL)
+        
+        use_key_check = Gtk.CheckButton("Using key")
+        use_key_check.connect("toggled", self.use_key, "Using key")
+        
+        choose_key_button = Gtk.Button.new_with_label("Choose key file")
+        choose_key_button.connect("clicked", self.key_choose_dialog)
+        
+        self.key_path = Gtk.Label("No key file selected")
+        self.key_path.set_line_wrap(True)
+        self.key_path.set_max_width_chars(20)
+        
+        get_hw_info_button = Gtk.Button.new_with_label("Get HW info")
+        get_hw_info_button.connect("clicked", self.get_hw_info_func)
+        
+        export_dmi_info_button = Gtk.Button.new_with_label("Export DMI info")
+        export_dmi_info_button.connect("clicked", self.export_dmi_info_func)
+        
+        remote_reboot_button = Gtk.Button.new_with_label("Reboot machine")
+        remote_reboot_button.connect("clicked", self.remote_reboot_func)
+        
+        remote_poweroff_button = Gtk.Button.new_with_label("Poweroff machine")
+        remote_poweroff_button.connect("clicked", self.remote_poweroff_func)
+        
+#### Packing
+        connect_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        connect_box.pack_start(label_remote, False, False, 3)
+        connect_box.pack_start(self.entry_host, False, False, 3)
+        connect_box.pack_start(self.entry_port, False, False, 3)
+        connect_box.pack_start(self.entry_user, False, False, 3)
+        connect_box.pack_start(self.entry_passwd, False, False, 3)
+        connect_box.pack_start(use_key_check, False, False, 3)
+        connect_box.pack_start(choose_key_button, False, False, 3)
+        connect_box.pack_start(self.key_path, False, False, 3)
+        connect_box.pack_start(connect_button, False, False, 3)
+        connect_box.pack_start(disconnect_button, False, False, 3)
+        connect_box.pack_start(label_wol, False, False, 3)
+        connect_box.pack_start(self.entry_mac, False, False, 3)
+        connect_box.pack_start(wakeonlan_button, False, False, 3)
+        
+        manage_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        manage_box.pack_start(label_services_control, False, False, 3)
+        manage_box.pack_start(startstop_button, False, False, 3)
+        manage_box.pack_start(enabledisable_button, False, False, 3)
+        manage_box.pack_start(label_machine_control, False, False, 3)
+        manage_box.pack_start(get_hw_info_button, False, False, 3)
+        manage_box.pack_start(export_dmi_info_button, False, False, 3)
+        manage_box.pack_start(remote_reboot_button, False, False, 3)
+        manage_box.pack_start(remote_poweroff_button, False, False, 3)
+        
+        self.box = Gtk.Box()
+        self.add(self.box)
+        
+        self.notebook = Gtk.Notebook()
+        
+        button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        services_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        
+        services_window = Gtk.ScrolledWindow()
+        services_window.set_hexpand(True)
+        services_window.set_vexpand(True)
+        
+        
+        services_box.pack_start(services_window, True, True, 3)
+        button_box.pack_start(connect_box, False, False, 3)
+        button_box.pack_start(manage_box, False, False, 3)
+        
+        self.box.pack_start(button_box, False, True, 0)
+        self.box.pack_start(self.notebook, True, True, 3)
+        
+        self.on_localhost()
+        
+        self.update_local = Thread(target=self.localhost_get_UnitFileState)
+        self.update_local.setDaemon(True)
+        self.update_local.start()
+        
+        self.update_remote = Thread(target=self.get_UnitFileState)
+        self.update_remote.setDaemon(True)
+        self.update_remote.start()
+        
+    def on_localhost(self):
+        path_number = 0
+        self.hosts.update({ 'localhost':[ None, "root", None, None, [ Gtk.ListStore(str, str, str, str, bool, int) ], None, None, None, None, None, None, [None, None, None, None, None, None, None, None, None, []], []] })
+        units = subprocess.Popen(self.cmd, shell=True, stdout=subprocess.PIPE)
+        out,err = units.communicate()
+        local_services_str = re.sub(r' +', ' ', out.decode('utf-8'))
+        local_services = local_services_str.splitlines()
+        for i in local_services:
+            self.hosts['localhost'][4][0].append([ i.split(" ")[0], i.split(" ")[1], None, None, False, path_number ])       # False for checkbox in list store
+            path_number += 1
+        self.hosts['localhost'][7] = len(local_services) - 1    #Number of services
+        self.hosts['localhost'][4].append(Gtk.TreeView(model=self.hosts['localhost'][4][0]))  #table [1]
+        self.hosts['localhost'][4].append(Gtk.CellRendererText()) #[2]
+        self.hosts['localhost'][4].append(Gtk.TreeViewColumn("Service", self.hosts['localhost'][4][2], text=0))   # [3]
+        self.hosts['localhost'][4][1].append_column(self.hosts['localhost'][4][3])
+        self.hosts['localhost'][4].append(Gtk.TreeViewColumn("UnitFileState", self.hosts['localhost'][4][2], text=1))  #[4]
+        self.hosts['localhost'][4][1].append_column(self.hosts['localhost'][4][4])
+        self.hosts['localhost'][4].append(Gtk.TreeViewColumn("ActiveState", self.hosts['localhost'][4][2], text=2))  #[5]
+        self.hosts['localhost'][4][1].append_column(self.hosts['localhost'][4][5])
+        self.hosts['localhost'][4].append(Gtk.TreeViewColumn("SubState", self.hosts['localhost'][4][2], text=3))    #[6]
+        self.hosts['localhost'][4][1].append_column(self.hosts['localhost'][4][6])
+        self.hosts['localhost'][4].append(Gtk.CellRendererToggle())  #[7]
+        self.hosts['localhost'][4][7].connect("toggled", self.on_cell_toggled)
+        self.hosts['localhost'][4].append(Gtk.TreeViewColumn("Select", self.hosts['localhost'][4][7], active=4))  #[8]
+        self.hosts['localhost'][4][1].append_column(self.hosts['localhost'][4][8])
+        self.hosts['localhost'][11][3] = Gtk.TreeStore(str, str)
+        self.hosts['localhost'][11][5] = Gtk.Notebook()
+        self.hosts['localhost'][11][6] = Gtk.ScrolledWindow()
+        self.hosts['localhost'][11][7] = Gtk.TreeView(model=self.hosts['localhost'][11][3])
+        self.hosts['localhost'][11][8] = Gtk.CellRendererText()
+        self.hosts['localhost'][12].append(Gtk.ScrolledWindow())
+        self.hosts['localhost'][12].append(Gtk.TextView())
+        self.hosts['localhost'][12].append(self.hosts['localhost'][12][1].get_buffer())
+        self.hosts['localhost'][12][2].set_text("Loading sensors info...")
+        self.hosts['localhost'][12][0].add(self.hosts['localhost'][12][1])
+        self.hosts['localhost'][11][7].append_column(Gtk.TreeViewColumn("Type", self.hosts['localhost'][11][8], text=0))
+        self.hosts['localhost'][11][7].append_column(Gtk.TreeViewColumn("Value", self.hosts['localhost'][11][8], text=1))
+        self.hosts['localhost'][11][6].add(self.hosts['localhost'][11][7])
+        self.hosts['localhost'][5] = Gtk.ScrolledWindow()
+        self.hosts['localhost'][5].set_hexpand(True)
+        self.hosts['localhost'][5].set_vexpand(True)
+        self.hosts['localhost'][5].add(self.hosts['localhost'][4][1])
+        self.hosts['localhost'][11][5].append_page(self.hosts['localhost'][5], Gtk.Label("Services"))
+        self.hosts['localhost'][11][5].append_page(self.hosts['localhost'][11][6], Gtk.Label("Hardware"))
+        self.hosts['localhost'][6] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.hosts['localhost'][6].pack_start(self.hosts['localhost'][11][5], True, True, 0)
+        
+        self.notebook.append_page(self.hosts['localhost'][6], Gtk.Label('localhost'))
+        self.notebook.show_all()
+
+    def connect_func(self, connect_button):
+        path_number = 0
+        self.host = self.entry_host.get_text()
+        self.port = int(self.entry_port.get_text())
+        self.user = self.entry_user.get_text()
+        self.passwd = self.entry_passwd.get_text()
+        self.hosts.update({ self.host:[ self.port, self.user, self.passwd, None, [ Gtk.ListStore(str, str, str, str, bool, int) ], None, None, None, True, None, None, [None, None, None, None, None, None, None, None, None, []]] })
+        self.hosts[self.host][3] = paramiko.SSHClient()
+        self.hosts[self.host][3].load_system_host_keys()
+        self.hosts[self.host][3].set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        if self.key_auth == True and self.key_file != "":
+            self.hosts[self.host][9] = self.key_file
+            self.hosts[self.host][3].connect(self.host, port=self.hosts[self.host][0], username=self.hosts[self.host][1], password=self.hosts[self.host][2], key_filename = self.hosts[self.host][8])
+            success_connect = True
+        elif self.key_auth == True and self.key_file == "":
+            dialog = YesNoDialog(self, "Selected key authentication method but no key file choosen.\nDo you want to use password authentication?")
+            response = dialog.run()
+            dialog.destroy()
+            if response == Gtk.ResponseType.OK:
+                self.key_auth = False
+                self.hosts[self.host][3].connect(self.host, port=self.hosts[self.host][0], username=self.hosts[self.host][1], password=self.hosts[self.host][2])
+                success_connect = True
+            else:
+                success_connect = False
+                self.use_key_check.set_active(False)
+        else:
+            self.hosts[self.host][3].connect(self.host, port=self.hosts[self.host][0], username=self.hosts[self.host][1], password=self.hosts[self.host][2])
+            success_connect = True
+            
+        if success_connect == True:
+            stdin, stdout, stderr = self.hosts[self.host][3].exec_command(self.cmd)
+            services_str = re.sub(r' +', ' ', stdout.read().decode('utf-8'))
+            services = services_str.rstrip().splitlines()
+            for i in services:
+                self.hosts[self.host][4][0].append([ i.split(" ")[0], i.split(" ")[1], None, None, False, path_number ])
+                path_number += 1
+                
+            self.hosts[self.host][7] = len(services) - 1
+            self.hosts[self.host][4].append(Gtk.TreeView(model=self.hosts[self.host][4][0]))  #table [1]
+            self.hosts[self.host][4].append(Gtk.CellRendererText()) #[2]
+            self.hosts[self.host][4].append(Gtk.TreeViewColumn("Service", self.hosts[self.host][4][2], text=0))   # [3]
+            self.hosts[self.host][4][1].append_column(self.hosts[self.host][4][3])
+            self.hosts[self.host][4].append(Gtk.TreeViewColumn("UnitFileState", self.hosts[self.host][4][2], text=1))  #[4]
+            self.hosts[self.host][4][1].append_column(self.hosts[self.host][4][4])
+            self.hosts[self.host][4].append(Gtk.TreeViewColumn("ActiveState", self.hosts[self.host][4][2], text=2))  #[5]
+            self.hosts[self.host][4][1].append_column(self.hosts[self.host][4][5])
+            self.hosts[self.host][4].append(Gtk.TreeViewColumn("SubState", self.hosts[self.host][4][2], text=3))    #[6]
+            self.hosts[self.host][4][1].append_column(self.hosts[self.host][4][6])
+            self.hosts[self.host][4].append(Gtk.CellRendererToggle())  #[7]
+            self.hosts[self.host][4][7].connect("toggled", self.on_cell_toggled)
+            self.hosts[self.host][4].append(Gtk.TreeViewColumn("Select", self.hosts[self.host][4][7], active=4))  #[8]
+            self.hosts[self.host][4][1].append_column(self.hosts[self.host][4][8])
+            self.hosts[self.host][11][3] = Gtk.TreeStore(str, str)
+            self.hosts[self.host][11][5] = Gtk.Notebook()
+            self.hosts[self.host][11][6] = Gtk.ScrolledWindow()
+            self.hosts[self.host][11][7] = Gtk.TreeView(model=self.hosts[self.host][11][3])
+            self.hosts[self.host][11][8] = Gtk.CellRendererText()
+            self.hosts[self.host][11][7].append_column(Gtk.TreeViewColumn("Type", self.hosts[self.host][11][8], text=0))
+            self.hosts[self.host][11][7].append_column(Gtk.TreeViewColumn("Value", self.hosts[self.host][11][8], text=1))
+            self.hosts[self.host][11][6].add(self.hosts[self.host][11][7])
+            self.hosts[self.host][5] = Gtk.ScrolledWindow()
+            self.hosts[self.host][5].set_hexpand(True)
+            self.hosts[self.host][5].set_vexpand(True)
+            self.hosts[self.host][5].add(self.hosts[self.host][4][1])
+            self.hosts[self.host][11][5].append_page(self.hosts[self.host][5], Gtk.Label("Services"))
+            self.hosts[self.host][11][5].append_page(self.hosts[self.host][11][6], Gtk.Label("Hardware"))
+            self.hosts[self.host][6] = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            self.hosts[self.host][6].pack_start(self.hosts[self.host][11][5], True, True, 0)
+            self.notebook.append_page(self.hosts[self.host][6], Gtk.Label(self.host))
+            self.notebook.show_all()
+            self.entry_passwd.set_text('')
+            self.hosts[self.host][8] = False
+            self.hosts[self.host][10] = self.hosts[self.host][3].get_transport()
+        else:
+            self.hosts.pop(self.host)
+        
+    def disconnect_func(self, disconnect_button):
+        self.who_is_active()
+        if self.active_host == "localhost":
+            err_dialog = ErrorDialog(self, "Disconnect from localhost? LOL")
+            response = err_dialog.run()
+            if response == Gtk.ResponseType.CANCEL:
+                    err_dialog.destroy()
+        else:
+            self.hosts[self.active_host][3].close()
+            self.notebook.remove_page(self.notebook.get_current_page())
+            self.notebook.show_all()
+            self.hosts.pop(self.active_host)
+            
+    def wakeonlan_func(self, wakeonlan_button):
+        wakeonlan.send_magic_packet(self.entry_mac.get_text())
+        
+    def change_state(self, startstop_button):
+        self.who_is_active()
+        services = []
+        parameters_list = {}
+        msg = ''
+        for i in range(0, self.hosts[self.active_host][7] + 1):
+            if self.hosts[self.active_host][4][0][i][4] == True:
+                path = i
+                service = self.hosts[self.active_host][4][0][i][0]
+                if self.hosts[self.active_host][4][0][i][3] == "running" or self.hosts[self.active_host][4][0][i][3] == "listening":
+                    command = "stop"
+                    msg += service + " will be stopped\n"
+                else:
+                    command = "start"
+                    msg += service + " will be started\n"
+                parameters_list.update({ service:[ command, path ] })
+        dialog = YesNoDialog(self, msg)
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            for i in parameters_list:
+                self.run_systemctl(parameters_list[i][1], i, parameters_list[i][0])
+        else:
+            services = []
+            msg = ''
+            
+    def change_unitfilestate(self, enabledisable_button):
+        self.who_is_active()
+        services = []
+        parameters_list = {}
+        msg = ''
+        for i in range(0, self.hosts[self.active_host][7] + 1):
+            if self.hosts[self.active_host][4][0][i][4] == True:
+                path = i
+                service = self.hosts[self.active_host][4][0][i][0]
+                if self.hosts[self.active_host][4][0][i][1] == "enabled":
+                    command = "disable"
+                    msg += service + " will be disabled\n"
+                else:
+                    command = "enable"
+                    msg += service + " will be enabled\n"
+                parameters_list.update({ service:[ command, path ] })
+        dialog = YesNoDialog(self, msg)
+        response = dialog.run()
+        dialog.destroy()
+        if response == Gtk.ResponseType.OK:
+            for i in parameters_list:
+                self.run_systemctl(parameters_list[i][1], i, parameters_list[i][0])
+        else:
+            services = []
+            msg = ''
+
+    def on_cell_toggled(self, widget, path):
+        self.who_is_active()
+        self.hosts[self.active_host][4][0][path][4] = not self.hosts[self.active_host][4][0][path][4]
+        
+    def who_is_active(self):
+        self.active_host = self.notebook.get_tab_label_text(self.notebook.get_nth_page(self.notebook.get_current_page()))
+        
+    def run_systemctl(self, path, service, command):
+        to_exec = "systemctl "+ command + " " + service
+        check_substate = "systemctl show -p SubState " + service
+        if self.active_host == 'localhost':
+            systemctl_cmd = subprocess.Popen(to_exec, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_raw, err_raw = systemctl_cmd.communicate()
+            if systemctl_cmd.returncode != 0:
+                err = err_raw.decode('utf-8').rstrip()
+                err_dialog = ErrorDialog(self, err)
+                response = err_dialog.run()
+                if response == Gtk.ResponseType.CANCEL:
+                    err_dialog.destroy()
+                self.update_service_states(self.active_host, path, service)
+            else:
+                self.update_service_states(self.active_host, path, service)
+                self.hosts[self.active_host][4][0][path][4] = False
+        else:
+            to_exec_remote = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + to_exec
+            ssh_result = self.hosts[self.active_host][10].open_session()
+            out_raw = ssh_result.makefile()
+            err_raw = ssh_result.makefile_stderr()
+            ssh_result.exec_command(to_exec_remote)
+            exit_status = ssh_result.recv_exit_status()
+            if exit_status != 0:
+                err = err_raw.read().decode("utf-8", "strict").rstrip()
+                err_dialog = ErrorDialog(self, err)
+                response = err_dialog.run()
+                if response == Gtk.ResponseType.CANCEL:
+                    err_dialog.destroy()
+                self.update_service_states(self.active_host, path, service)
+            else:
+                self.update_service_states(self.active_host, path, service)
+                self.hosts[self.active_host][4][0][path][4] = False
+            ssh_result.close()
+                
+    def localhost_get_UnitFileState(self):
+        for i in range(0, self.hosts["localhost"][7] + 1):
+            is_enabled = "systemctl show --property SubState,ActiveState,UnitFileState " + self.hosts["localhost"][4][0][i][0]
+            result = subprocess.Popen(is_enabled, shell=True, stdout=subprocess.PIPE)
+            out_raw, err_raw = result.communicate()
+            out_list = out_raw.decode("utf-8").rstrip().splitlines()
+            for k in out_list:
+                if k.split("=")[0] == "SubState":
+                    self.hosts["localhost"][4][0][i][3] = k.split("=")[1]
+                elif k.split("=")[0] == "UnitFileState":
+                    self.hosts["localhost"][4][0][i][1] = k.split("=")[1]
+                elif k.split("=")[0] == "ActiveState":
+                    self.hosts["localhost"][4][0][i][2] = k.split("=")[1]
+                else:
+                    print("WTF???")
+            
+    def get_UnitFileState(self):
+        while True:
+            for k in list(self.hosts):
+                if k != "localhost" and self.hosts[k][8] == False:
+                    for i in range(0, self.hosts[k][7] + 1):
+                        is_enabled = "systemctl show --property SubState,ActiveState,UnitFileState " + self.hosts[k][4][0][i][0]
+                        stdin, out_raw, err_raw = self.hosts[k][3].exec_command(is_enabled)
+                        out_list = out_raw.read().decode('utf-8').rstrip().splitlines()
+                        for l in out_list:
+                            if l.split("=")[0] == "SubState":
+                                self.hosts[k][4][0][i][3] = l.split("=")[1]
+                            elif l.split("=")[0] == "UnitFileState":
+                                self.hosts[k][4][0][i][1] = l.split("=")[1]
+                            elif l.split("=")[0] == "ActiveState":
+                                self.hosts[k][4][0][i][2] = l.split("=")[1]
+                            else:
+                                print("WTF???")
+                    self.hosts[k][8] = True
+            time.sleep(1)
+            
+    def update_service_states(self, current_hostname, path, service):
+        check_state = "systemctl show -p UnitFileState,SubState,ActiveState " + service
+        if current_hostname != "localhost":
+            ssh_result = self.hosts[self.host][10].open_session()
+            out_raw = ssh_result.makefile()
+            ssh_result.exec_command(check_state)
+            out_list = out_raw.read().decode("utf-8", "strict").rstrip().splitlines()
+            ssh_result.close()
+        else:
+            result = subprocess.Popen(check_state, shell=True, stdout=subprocess.PIPE)
+            out_raw, err_raw = result.communicate()
+            out_list = out_raw.decode("utf-8").rstrip().splitlines()
+        for i in out_list:
+            if i.split("=")[0] == "ActiveState":
+                self.hosts[current_hostname][4][0][path][2] = i.split("=")[1]
+            elif i.split("=")[0] == "SubState":
+                self.hosts[current_hostname][4][0][path][3] = i.split("=")[1]
+            elif i.split("=")[0] == "UnitFileState":
+                self.hosts[current_hostname][4][0][path][1] = i.split("=")[1]
+            else:
+                print("WTF???")
+        
+                
+    def key_choose_dialog(self, widget):
+        dialog = Gtk.FileChooserDialog("Please choose a file", self,
+            Gtk.FileChooserAction.OPEN,
+            (Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL,
+             Gtk.STOCK_OPEN, Gtk.ResponseType.OK))
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            self.key_file = dialog.get_filename()
+            self.key_path.set_text("Choosen key:\n" + self.key_file)
+        dialog.destroy()
+        
+    def use_key(self, use_key_check, name):
+        if use_key_check.get_active() == True:
+            self.key_auth = True
+        else:
+            self.key_auth = False
+            
+    def get_hw_info_func(self, get_hw_info_button):
+        self.who_is_active()
+        pci_info_cmd = "lspci -v"
+        usb_info_cmd = "lsusb"
+        netif_cmd = "ip a"
+        logicaldev_cmd = "lsblk -o NAME,LABEL,SIZE,FSTYPE,PARTLABEL,TYPE"
+        
+        if self.active_host == "localhost":
+            storage_info_cmd = "lshw -class disk"
+            display_info_cmd = "get-edid | parse-edid"
+            hw_info_cmd = "python3 -c 'import dmidecode; x = [ k for i in range(0,43) for k in dmidecode.get_by_type(i) ]; print(x)'"
+            hw_info = subprocess.Popen(hw_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            out_raw, err_raw = hw_info.communicate()
+            if hw_info.returncode != 0:
+                print(err_raw.decode('utf-8').rstrip())
+            else:
+                dmidecode_devices = ast.literal_eval(out_raw.decode('utf-8').rstrip())
+                
+            pci_info = subprocess.Popen(pci_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            pci_out_raw, pci_out_err = pci_info.communicate()
+            pci_devices = pci_out_raw.decode('utf-8').rstrip()
+            
+            usb_info = subprocess.Popen(usb_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            usb_info_raw, usb_info_err = usb_info.communicate()
+            usb_devices = usb_info_raw.decode('utf-8').rstrip()
+            
+            storage_info = subprocess.Popen(storage_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            storage_info_raw, storage_info_err = storage_info.communicate()
+            storage_devices = storage_info_raw.decode("utf-8").rstrip()
+            
+            logicaldev_info = subprocess.Popen(logicaldev_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            logicaldev_info_raw, logicaldev_info_err = logicaldev_info.communicate()
+            logicaldev_devices = logicaldev_info_raw.decode("utf-8").rstrip()
+            
+            netif_info = subprocess.Popen(netif_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            netif_info_raw, netif_info_err = netif_info.communicate()
+            netif_devices = netif_info_raw.decode("utf-8").rstrip()
+            
+            display_info = subprocess.Popen(display_info_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            display_info_raw, display_info_err = display_info.communicate()
+            display = display_info_raw.decode("utf-8").rstrip()
+            
+        else:
+            storage_info_cmd = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + "lshw -class disk"
+            display_info_cmd = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + "get-edid | parse-edid"
+            hw_info_cmd = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + "python3 -c 'import dmidecode; x = [ k for i in range(0,43) for k in dmidecode.get_by_type(i) ]; print(x)'"
+            hw_info_session = self.hosts[self.active_host][10].open_session()
+            hw_info_read = hw_info_session.makefile()
+            hw_info_err = hw_info_session.makefile_stderr()
+            hw_info_session.exec_command(hw_info_cmd)
+            out_raw = hw_info_read.read()
+            err_raw = hw_info_err.read()
+            exit_status = hw_info_session.recv_exit_status()
+            if exit_status != 0:
+                print(err_raw.decode('utf-8').rstrip())
+            else:
+                dmidecode_devices = ast.literal_eval(out_raw.decode('utf-8').rstrip())
+            hw_info_session.close()
+            
+            usb_info_session = self.hosts[self.active_host][10].open_session()
+            usb_info_read = usb_info_session.makefile()
+            usb_info_err = usb_info_session.makefile_stderr()
+            usb_info_session.exec_command(usb_info_cmd)
+            usb_devices_raw = usb_info_read.read()
+            usb_devices = usb_devices_raw.decode("utf-8").rstrip()
+            usb_info_session.close()
+            
+            pci_info_session = self.hosts[self.active_host][10].open_session()
+            pci_info_read = pci_info_session.makefile()
+            pci_info_err = pci_info_session.makefile_stderr()
+            pci_info_session.exec_command(pci_info_cmd)
+            pci_devices_raw = pci_info_read.read()
+            pci_devices = pci_devices_raw.decode("utf-8").rstrip()
+            pci_info_session.close()
+            
+            storage_info_session = self.hosts[self.active_host][10].open_session()
+            storage_info_read = storage_info_session.makefile()
+            storage_info_err = storage_info_session.makefile_stderr()
+            storage_info_session.exec_command(storage_info_cmd)
+            storage_devices_raw = storage_info_read.read()
+            storage_devices = storage_devices_raw.decode("utf-8").rstrip()
+            storage_info_session.close()
+            
+            netif_info_session = self.hosts[self.active_host][10].open_session()
+            netif_info_read = netif_info_session.makefile()
+            netif_info_err = netif_info_session.makefile_stderr()
+            netif_info_session.exec_command(netif_cmd)
+            netif_devices_raw = netif_info_read.read()
+            netif_devices = netif_devices_raw.decode("utf-8").rstrip()
+            netif_info_session.close()
+            
+            logicaldev_info_session = self.hosts[self.active_host][10].open_session()
+            logicaldev_info_read = logicaldev_info_session.makefile()
+            logicaldev_info_err = logicaldev_info_session.makefile_stderr()
+            logicaldev_info_session.exec_command(logicaldev_cmd)
+            logicaldev_devices_raw = logicaldev_info_read.read()
+            logicaldev_devices = logicaldev_devices_raw.decode("utf-8").rstrip()
+            logicaldev_info_session.close()
+            
+            display_info_session = self.hosts[self.active_host][10].open_session()
+            display_info_read = display_info_session.makefile()
+            display_info_err = display_info_session.makefile_stderr()
+            display_info_session.exec_command(display_info_cmd)
+            display_raw = display_info_read.read()
+            display = display_raw.decode("utf-8").rstrip()
+            
+        last_dminame = ""
+        dmitype_count = 0
+        dmidecode_list = []
+        dmidecode_device_props = {}
+        self.hosts[self.active_host][11][0] = {}
+        for devs in dmidecode_devices:
+            if devs["DMIName"] == last_dminame:
+                dmitype_count += 1
+                for prop in devs:
+                    if isinstance(devs[prop], int):
+                        dev_prop_str = str(devs[prop])
+                    else:
+                        dev_prop_str = devs[prop]
+                    dmidecode_device_props.update({prop: dev_prop_str})
+            else:
+                dmitype_count = 0
+                last_dminame = devs["DMIName"]
+                for prop in devs:
+                    if isinstance(devs[prop], int):
+                        dev_prop_str = str(devs[prop])
+                    else:
+                        dev_prop_str = devs[prop]
+                    dmidecode_device_props.update({prop: dev_prop_str})
+            self.hosts[self.active_host][11][0].update({devs["DMIName"] + ", Dev. No" + str(dmitype_count): dmidecode_device_props})
+            dmidecode_device_props = {}
+        text_buffer = json.dumps(self.hosts[self.active_host][11][0], sort_keys=False, indent=4)
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["DMI strings", ""]))
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][0], [text_buffer, ""])
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["USB Devices", ""]))
+        for usb_dev in usb_devices.splitlines():
+            self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][1], [usb_dev, ""])
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["PCI Devices", ""]))
+        
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][2], [pci_devices, ""])
+        pci_devices_split = re.sub(r"\A\n\Z", "-splithere-", pci_devices).split("-splithere-")
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["Storage Devices", ""]))
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][3], [storage_devices, ""])
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["Logical devices", ""]))
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][4], [logicaldev_devices, ""])
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["Network interfaces", ""]))
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][5], [netif_devices, ""])
+        
+        self.hosts[self.active_host][11][9].append(self.hosts[self.active_host][11][3].append(None, ["Display", ""]))
+        self.hosts[self.active_host][11][3].append(self.hosts[self.active_host][11][9][6], [display, ""])
+        
+        self.hosts[self.active_host][11][7].collapse_all()
+        self.hosts[self.active_host][11][5].show_all()
+        
+    def export_dmi_info_func(self, export_dmi_info_button):
+        self.who_is_active()
+        json_hw_wrout = open("/var/" + self.active_host + ".json", "w")
+        json.dump(self.hosts[self.active_host][11][0], json_hw_wrout)
+        json_hw_wrout.flush()
+        json_hw_wrout.close()
+        
+    def remote_reboot_func(self, remote_reboot_button):
+        self.who_is_active()
+        if self.active_host != "localhost":
+            cmd = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + "systemctl reboot"
+            reboot_cmd = self.hosts[self.active_host][10].open_session()
+            reboot_cmd_err = reboot_cmd.makefile_stderr()
+            reboot_cmd.exec_command(cmd)
+            err_raw = reboot_cmd_err.read()
+            exit_status = reboot_cmd.recv_exit_status()
+            if exit_status != 0:
+                err = err_raw.read().decode("utf-8", "strict").rstrip()
+                err_dialog = ErrorDialog(self, err)
+                response = err_dialog.run()
+                if response == Gtk.ResponseType.CANCEL:
+                    err_dialog.destroy()
+            self.hosts[self.active_host][3].close()
+            self.notebook.remove_page(self.notebook.get_current_page())
+            self.notebook.show_all()
+            self.hosts.pop(self.active_host)
+        
+    def remote_poweroff_func(self, remote_poweroff_button):
+        self.who_is_active()
+        if self.active_host != "localhost":
+            cmd = "echo " + self.hosts[self.active_host][2] + " | sudo -S " + "systemctl poweroff"
+            poweroff_cmd = self.hosts[self.active_host][10].open_session()
+            poweroff_cmd_err = poweroff_cmd.makefile_stderr()
+            poweroff_cmd.exec_command(cmd)
+            err_raw = poweroff_cmd_err.read()
+            exit_status = poweroff_cmd.recv_exit_status()
+            if exit_status != 0:
+                err = err_raw.read().decode("utf-8", "strict").rstrip()
+                err_dialog = ErrorDialog(self, err)
+                response = err_dialog.run()
+                if response == Gtk.ResponseType.CANCEL:
+                    err_dialog.destroy()
+            self.hosts[self.active_host][3].close()
+            self.notebook.remove_page(self.notebook.get_current_page())
+            self.notebook.show_all()
+            self.hosts.pop(self.active_host)
+            
+win = AdminWindow()
+win.connect("destroy", Gtk.main_quit)
+win.show_all()
+Gtk.main()

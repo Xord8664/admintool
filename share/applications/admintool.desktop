@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=9.0
+Icon=system-run
+Type=Application
+Categories=System
+Exec=pkexec /usr/local/bin/ant-admintool
+Name=Administration tool
+GenericName[ru]=Мониторинг и управление
